@@ -43,60 +43,79 @@ export const fetchLatestPlayerStats = async (player: Player): Promise<{ stats: P
 
   const model = "gemini-2.5-flash"; 
   
-  // FINAL RECOVERY STRATEGY: AUTHORITY SOURCE ONLY
-  // The previous method "guessed" games. This method forces the AI to look at 
-  // trusted databases (ESPNcricinfo, Cricbuzz, BCCI) and only report what it sees.
+  // FINAL FIX STRATEGY: DUAL-STREAM EXTRACTION
+  // 1. Do not assume role. Extract BOTH batting and bowling for every match.
+  // 2. Explicitly handle "DNB" (Did Not Bat) to fix the Match vs Innings count.
+  // 3. Verify specific match opponents to avoid "random games".
   
   const prompt = `
-    You are a data extraction engine for Cricket Stats.
+    You are a Professional Cricket Scorer.
     
-    TARGET PLAYER: "${player.name}"
-    TEAM: "${player.smatTeam}"
-    TOURNAMENT: Syed Mushtaq Ali Trophy 2025 (SMAT)
-    DATE RANGE: Nov 2025 - Dec 2025
+    TARGET:
+    - Player: "${player.name}"
+    - Team: "${player.smatTeam}"
+    - Tournament: Syed Mushtaq Ali Trophy 2025 (SMAT)
+    - Period: Nov 2025 - Dec 2025
+    
+    **YOUR MISSION:**
+    Build a precise match-by-match log.
 
-    **YOUR TASK:**
-    1. Search SPECIFICALLY for the scorecard profile on trusted sites.
-    2. Extract the exact scores from the most recent matches.
-    
     **SEARCH QUERY:**
     site:espncricinfo.com OR site:cricbuzz.com OR site:bcci.tv "${player.name}" "${player.smatTeam}" Syed Mushtaq Ali Trophy 2025 scorecard
 
-    **CRITICAL RULES (ZERO HALLUCINATION):**
-    1. **NO PREDICTIONS**: Ignore "Fantasy Tips", "Predicted XI", or "Dream11" articles. They contain fake stats.
-    2. **STRICT MATCHING**: Only log a match if you see a **Scorecard Result**.
-    3. **RUNS vs BALLS**: 
-       - Text "14(10)" means **14 Runs** (10 Balls).
-       - Text "10(14)" means **10 Runs** (14 Balls).
-       - ALWAYS prioritize the first number as Runs unless the text explicitly says "10 runs off 14 balls".
-    4. **DNB (Did Not Bat)**: If a player played but didn't bat, Runs = 0, Innings = 0.
-    5. **NO FAKE GAMES**: If the search results only show 2 games, output 2 games. Do not invent a 3rd game to fill space.
+    **EXTRACTION PROTOCOL (STRICT):**
+    
+    1. **FIND MATCHES**:
+       - Identify confirmed matches played by "${player.smatTeam}" where "${player.name}" was in the Playing XI.
+       - **IGNORE** matches where he was on the bench.
+    
+    2. **FOR EACH MATCH FOUND (Dual-Stream Check)**:
+       - **Check Batting**: 
+         - Search for runs/balls (e.g., "14(10)"). 
+         - **Important**: If he played (e.g., bowled) but did not bat, mark Batting as "**DNB**".
+       - **Check Bowling**: 
+         - Search for figures (e.g., "4-0-24-2" or "2/24"). 
+         - If he did not bowl, mark Bowling as "**-**".
+    
+    3. **VERIFY SCORES**:
+       - "14(10)" = 14 Runs, 10 Balls.
+       - "4/20" = 4 Wickets, 20 Runs.
+       - Do not mix these up.
+
+    4. **CALCULATE TOTALS (Sum of Log Only)**:
+       - **matches**: Count of games where (Batting != null OR Bowling != null).
+       - **innings**: Count of games where Batting != "DNB" and Batting != "-".
+       - **runs**: Sum of batting runs.
+       - **wickets**: Sum of bowling wickets.
+       - **highestScore**: Max score from batting.
+       - **bestBowling**: Best figures from bowling.
 
     **OUTPUT JSON FORMAT:**
     {
-      "role": "Batsman" | "Bowler" | "All-Rounder" | "Wicket Keeper",
-      "matches": number, 
-      "innings": number,
-      "runs": number, 
-      "ballsFaced": number,
-      "battingAverage": number, 
-      "battingStrikeRate": number, 
-      "highestScore": string, 
-
-      "wickets": number, 
-      "runsConceded": number,
-      "overs": number,
-      "economy": number,
-      "bestBowling": string,
-
-      "recentMatches": [
-         { 
-           "date": "Date/Month", 
-           "opponent": "vs Team", 
-           "performance": "e.g. 45(30) & 0/15" 
-         }
+      "matchLog": [
+        { 
+          "opponent": "vs TeamName", 
+          "date": "DD MMM", 
+          "batting": "e.g. 24(12) or DNB", 
+          "bowling": "e.g. 2/24 or -"
+        }
       ],
-      "summary": "One sentence summary of verified matches."
+      "totals": {
+        "matches": number,
+        "innings": number,
+        "runs": number,
+        "ballsFaced": number,
+        "highestScore": string,
+        "battingAverage": number,
+        "battingStrikeRate": number,
+        "wickets": number,
+        "runsConceded": number,
+        "overs": number,
+        "economy": number,
+        "bestBowling": string
+      },
+      "derivedRole": "Batsman" | "Bowler" | "All-Rounder" | "Wicket Keeper",
+      "summary": "Brief summary of performance."
     }
   `;
 
@@ -122,27 +141,45 @@ export const fetchLatestPlayerStats = async (player: Player): Promise<{ stats: P
 
       const data = cleanAndParseJSON(text);
 
+      // Map the AI's "matchLog" to the app's "recentMatches" format
+      // We combine batting and bowling into a single "performance" string for the UI
+      const mappedRecentMatches = (data.matchLog || []).map((m: any) => {
+        let perf = "";
+        if (m.batting && m.batting !== "-" && m.batting !== "DNB") perf += `🏏 ${m.batting} `;
+        else if (m.batting === "DNB") perf += `🏏 DNB `;
+        
+        if (m.bowling && m.bowling !== "-" && m.bowling !== "DNB") perf += `🏐 ${m.bowling}`;
+        
+        return {
+          opponent: m.opponent,
+          date: m.date,
+          performance: perf.trim() || "Played"
+        };
+      });
+
       return {
         stats: {
-          matches: data.matches || 0,
-          innings: data.innings,
-          runs: data.runs,
-          ballsFaced: data.ballsFaced,
-          battingAverage: data.battingAverage,
-          battingStrikeRate: data.battingStrikeRate,
-          highestScore: data.highestScore,
-          overs: data.overs,
-          wickets: data.wickets,
-          runsConceded: data.runsConceded,
-          economy: data.economy,
-          bowlingAverage: data.bowlingAverage,
-          bowlingStrikeRate: data.bowlingStrikeRate,
-          bestBowling: data.bestBowling,
-          recentMatches: data.recentMatches || [],
+          matches: data.totals?.matches || 0,
+          innings: data.totals?.innings || 0,
+          runs: data.totals?.runs || 0,
+          ballsFaced: data.totals?.ballsFaced || 0,
+          battingAverage: data.totals?.battingAverage,
+          battingStrikeRate: data.totals?.battingStrikeRate,
+          highestScore: data.totals?.highestScore,
+          
+          overs: data.totals?.overs || 0,
+          wickets: data.totals?.wickets || 0,
+          runsConceded: data.totals?.runsConceded,
+          economy: data.totals?.economy,
+          bowlingAverage: 0, // AI often struggles with this derived stat, simpler to omit or calc if needed
+          bowlingStrikeRate: 0,
+          bestBowling: data.totals?.bestBowling,
+          
+          recentMatches: mappedRecentMatches,
           summary: data.summary,
           lastUpdated: new Date().toISOString()
         },
-        role: data.role || 'Unknown',
+        role: data.derivedRole || 'Unknown',
         source: sourceUrl
       };
 
